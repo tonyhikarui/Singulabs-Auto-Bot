@@ -6,7 +6,6 @@ const path = require('path');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const chalk = require('chalk');
-const { SiweMessage } = require('siwe');
 const banner = require('./banner');
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -45,7 +44,6 @@ function loadProxies() {
 
 function getProxyAgent(proxy) {
     if (!proxy) return null;
-    
     try {
         if (proxy.toLowerCase().startsWith('socks')) {
             return new SocksProxyAgent(proxy);
@@ -58,29 +56,23 @@ function getProxyAgent(proxy) {
     }
 }
 
-async function downloadImage(url, filename, proxyAgent) {
-    const options = {
-        url,
-        method: 'GET',
-        responseType: 'stream'
-    };
-
-    if (proxyAgent) {
-        options.httpsAgent = proxyAgent;
-        options.proxy = false;
-    }
-
+function deleteLocalFiles(pattern) {
     try {
-        const response = await axios(options);
-        return new Promise((resolve, reject) => {
-            const writer = fs.createWriteStream(filename);
-            response.data.pipe(writer);
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-        });
+        const files = fs.readdirSync(__dirname);
+        let deletedCount = 0;
+        
+        for (const file of files) {
+            if (file.match(pattern)) {
+                fs.unlinkSync(path.join(__dirname, file));
+                deletedCount++;
+            }
+        }
+        
+        if (deletedCount > 0) {
+            console.log(chalk.green(`Deleted ${deletedCount} local files matching pattern: ${pattern}`));
+        }
     } catch (error) {
-        console.error(chalk.red('Error downloading image:', error.message));
-        throw error;
+        console.error(chalk.red('Error deleting local files:', error));
     }
 }
 
@@ -93,9 +85,8 @@ class ImageComparisonBot {
         this.authToken = null;
         this.webDomain = 'tools.singulabs.xyz';
         this.proxyAgent = getProxyAgent(proxyUrl);
-        this.imageUrls = [
-            'https://picsum.photos/800/600'
-        ];
+        this.uploadedImages = new Set();
+        this.localFiles = new Set();
 
         this.axiosInstance = axios.create({
             httpsAgent: this.proxyAgent,
@@ -108,29 +99,114 @@ class ImageComparisonBot {
         }
     }
 
-    getRandomImageUrl() {
-        return this.imageUrls[Math.floor(Math.random() * this.imageUrls.length)];
-    }
-
-    async getRandomImages() {
-        const timestamp = Date.now();
-        const originalPath = path.join(__dirname, `original_${this.walletIndex}_${timestamp}.jpg`);
-        const comparePath = path.join(__dirname, `compare_${this.walletIndex}_${timestamp}.jpg`);
-
-        console.log(chalk.yellow(`[Wallet ${this.walletIndex + 1}] Downloading random images...`));
-        await downloadImage(this.getRandomImageUrl(), originalPath, this.proxyAgent);
-        await sleep(1000);
-        await downloadImage(this.getRandomImageUrl(), comparePath, this.proxyAgent);
-
-        return { originalPath, comparePath };
-    }
-
-    cleanupImages(originalPath, comparePath) {
+    async getServerImages() {
         try {
-            if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
-            if (fs.existsSync(comparePath)) fs.unlinkSync(comparePath);
+            const response = await this.axiosInstance.get(
+                `${this.baseUrl}/api/images`,
+                {
+                    headers: {
+                        'Authorization': `Bearer ${this.authToken}`,
+                        'Origin': `https://${this.webDomain}`,
+                        'Referer': `https://${this.webDomain}/`,
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
+                    }
+                }
+            );
+
+            if (response.data.status === "success") {
+                return response.data.images;
+            }
+            return [];
         } catch (error) {
-            console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] Error cleaning up images:`, error));
+            console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] Failed to get server images:`, error.message));
+            return [];
+        }
+    }
+
+    async deleteServerImages() {
+        try {
+            const images = await this.getServerImages();
+            if (images.length > 0) {
+                console.log(chalk.yellow(`[Wallet ${this.walletIndex + 1}] Found ${images.length} images to delete`));
+                
+                for (const imagePath of images) {
+                    try {
+                        const imageId = imagePath.split('/').pop();
+                        await this.axiosInstance.delete(
+                            `${this.baseUrl}/api/images/${imageId}`,
+                            {
+                                headers: {
+                                    'Authorization': `Bearer ${this.authToken}`,
+                                    'Origin': `https://${this.webDomain}`,
+                                    'Referer': `https://${this.webDomain}/`
+                                }
+                            }
+                        );
+                        console.log(chalk.green(`[Wallet ${this.walletIndex + 1}] Deleted server image: ${imageId}`));
+                        await sleep(500);
+                    } catch (error) {
+                        console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] Failed to delete server image: ${error.message}`));
+                    }
+                }
+            }
+        } catch (error) {
+            console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] Error in deleteServerImages:`, error.message));
+        }
+    }
+
+    async cleanupLocalFiles() {
+        try {
+            // Delete both original and compare images for this wallet
+            const originalPattern = new RegExp(`original_${this.walletIndex}_\\d+.*\\.jpg`);
+            const comparePattern = new RegExp(`compare_${this.walletIndex}_\\d+.*\\.jpg`);
+            
+            deleteLocalFiles(originalPattern);
+            deleteLocalFiles(comparePattern);
+            
+            this.localFiles.clear();
+        } catch (error) {
+            console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] Error cleaning up local files:`, error.message));
+        }
+    }
+
+    async uploadRandomImage(isOriginal = true, index = 0) {
+        const timestamp = Date.now();
+        const filename = isOriginal 
+            ? `original_${this.walletIndex}_${timestamp}_${index}.jpg`
+            : `compare_${this.walletIndex}_${timestamp}.jpg`;
+        const filepath = path.join(__dirname, filename);
+
+        try {
+            const width = Math.floor(Math.random() * 200) + 600;
+            const height = Math.floor(Math.random() * 200) + 400;
+            const formData = new FormData();
+            formData.append('file', Buffer.alloc(width * height), {
+                filename,
+                contentType: 'image/jpeg'
+            });
+
+            const response = await this.axiosInstance.post(
+                `${this.baseUrl}/api/${isOriginal ? 'upload' : 'compare'}`,
+                formData,
+                {
+                    headers: {
+                        ...formData.getHeaders(),
+                        'Authorization': `Bearer ${this.authToken}`,
+                        'Origin': `https://${this.webDomain}`,
+                        'Referer': `https://${this.webDomain}/`
+                    }
+                }
+            );
+
+            console.log(chalk.green(`[Wallet ${this.walletIndex + 1}] ${isOriginal ? 'Upload' : 'Compare'} successful`));
+            if (isOriginal) {
+                this.uploadedImages.add(filename);
+            }
+            this.localFiles.add(filename);
+            return response.data;
+        } catch (error) {
+            console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] ${isOriginal ? 'Upload' : 'Compare'} failed:`, error.message));
+            throw error;
         }
     }
 
@@ -214,58 +290,24 @@ Issued At: ${now.toISOString()}`;
         }
     }
 
-    async uploadOriginalImage(imagePath) {
+    async runCycle() {
         try {
-            if (!this.authToken) throw new Error('Not authenticated');
+            // Clean up previous files
+            await this.deleteServerImages();
+            await this.cleanupLocalFiles();
+            await sleep(2000);
 
-            const formData = new FormData();
-            formData.append('file', fs.createReadStream(imagePath));
+            // Upload 4 original images
+            for (let i = 0; i < 4; i++) {
+                await this.uploadRandomImage(true, i);
+                await sleep(1000);
+            }
 
-            const response = await this.axiosInstance.post(
-                `${this.baseUrl}/api/upload`,
-                formData,
-                {
-                    headers: {
-                        ...formData.getHeaders(),
-                        'Authorization': `Bearer ${this.authToken}`,
-                        'Origin': `https://${this.webDomain}`,
-                        'Referer': `https://${this.webDomain}/`
-                    }
-                }
-            );
-
-            console.log(chalk.green(`[Wallet ${this.walletIndex + 1}] Upload successful`));
-            return response.data;
+            // Upload 1 compare image
+            await this.uploadRandomImage(false);
+            
+            await sleep(1000);
         } catch (error) {
-            console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] Upload failed:`, error.message));
-            throw error;
-        }
-    }
-
-    async compareImage(compareImagePath) {
-        try {
-            if (!this.authToken) throw new Error('Not authenticated');
-
-            const formData = new FormData();
-            formData.append('file', fs.createReadStream(compareImagePath));
-
-            const response = await this.axiosInstance.post(
-                `${this.baseUrl}/api/compare`,
-                formData,
-                {
-                    headers: {
-                        ...formData.getHeaders(),
-                        'Authorization': `Bearer ${this.authToken}`,
-                        'Origin': `https://${this.webDomain}`,
-                        'Referer': `https://${this.webDomain}/`
-                    }
-                }
-            );
-
-            console.log(chalk.green(`[Wallet ${this.walletIndex + 1}] Comparison successful`));
-            return response.data;
-        } catch (error) {
-            console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] Comparison failed:`, error.message));
             throw error;
         }
     }
@@ -283,18 +325,13 @@ Issued At: ${now.toISOString()}`;
                 const startPoints = await this.getPoints();
                 console.log(chalk.yellow(`[Wallet ${this.walletIndex + 1}] Current points:`, startPoints));
 
-                const { originalPath, comparePath } = await this.getRandomImages();
-                
-                await this.uploadOriginalImage(originalPath);
-                await this.compareImage(comparePath);
+                await this.runCycle();
 
                 const endPoints = await this.getPoints();
                 console.log(chalk.green(`[Wallet ${this.walletIndex + 1}] Points earned:`, endPoints - startPoints));
 
-                this.cleanupImages(originalPath, comparePath);
-
-                console.log(chalk.yellow(`[Wallet ${this.walletIndex + 1}] Waiting 30 seconds before next cycle...`));
-                await sleep(30000);
+                console.log(chalk.yellow(`[Wallet ${this.walletIndex + 1}] Waiting 60 seconds before next cycle...`));
+                await sleep(60000);
 
             } catch (error) {
                 console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] Error:`, error.message));
@@ -304,7 +341,7 @@ Issued At: ${now.toISOString()}`;
                     this.authToken = null;
                 }
 
-                await sleep(30000);
+                await sleep(60000);
             }
         }
     }
@@ -326,10 +363,25 @@ async function main() {
         await Promise.all(bots.map(bot => bot.runContinuous()));
 
     } catch (error) {
-        console.error(chalk.red('Fatal error:', error.message));
+        console.error(chalk.red('Fatal error:', error));
         process.exit(1);
     }
 }
 
+// Error handlers
+process.on('uncaughtException', (error) => {
+    console.error(chalk.red('Uncaught Exception:', error));
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(chalk.red('Unhandled Rejection at:', promise));
+    console.error(chalk.red('Reason:', reason));
+    process.exit(1);
+});
+
 // Run the main function
-main().catch(console.error);
+main().catch(error => {
+    console.error(chalk.red('Fatal error in main:', error));
+    process.exit(1);
+});
