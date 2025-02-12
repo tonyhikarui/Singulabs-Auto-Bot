@@ -14,5 +14,5 @@ module.exports = `
        ██║██║╚██╗██║╚════██║██║██║  ██║██╔══╝  ██╔══██╗    
        ██║██║ ╚████║███████║██║██████╔╝███████╗██║  ██║    
        ╚═╝╚═╝  ╚═══╝╚══════╝╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝    
-            ${chalk.yellow('KITE AI  AUTO - BOT')}                
-📢  ${chalk.yellow('Telegram Channel: https://t.me/AirdropInsiderID')}`;
+             ${chalk.yellow('SINGULABS AUTO - BOT')}                
+ 📢  ${chalk.yellow('Telegram Channel: https://t.me/AirdropInsiderID')}`;
