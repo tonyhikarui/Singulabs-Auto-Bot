@@ -169,7 +169,11 @@ class ImageComparisonBot {
         }
     }
 
-    async uploadRandomImage(isOriginal = true, index = 0) {
+    isServerError(error) {
+        return error.response && error.response.status >= 500 && error.response.status < 600;
+    }
+
+    async uploadRandomImage(isOriginal = true, index = 0, retryCount = 0) {
         const timestamp = Date.now();
         const filename = isOriginal 
             ? `original_${this.walletIndex}_${timestamp}_${index}.jpg`
@@ -205,6 +209,22 @@ class ImageComparisonBot {
             this.localFiles.add(filename);
             return response.data;
         } catch (error) {
+            if (error.response?.status === 429 || this.isServerError(error)) {
+                const maxRetries = 5;
+                if (retryCount < maxRetries) {
+                    const baseDelay = error.response?.status === 429 ? 2000 : 5000;
+                    const delay = Math.pow(2, retryCount) * baseDelay + Math.random() * 2000;
+                    const errorType = error.response?.status === 429 ? 'Rate limited' : 'Server error';
+                    
+                    console.log(chalk.yellow(
+                        `[Wallet ${this.walletIndex + 1}] ${errorType} (${error.response?.status}), ` +
+                        `retrying in ${Math.floor(delay/1000)}s (attempt ${retryCount + 1}/${maxRetries})`
+                    ));
+                    
+                    await sleep(delay);
+                    return this.uploadRandomImage(isOriginal, index, retryCount + 1);
+                }
+            }
             console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] ${isOriginal ? 'Upload' : 'Compare'} failed:`, error.message));
             throw error;
         }
@@ -295,24 +315,27 @@ Issued At: ${now.toISOString()}`;
             // Clean up previous files
             await this.deleteServerImages();
             await this.cleanupLocalFiles();
-            await sleep(2000);
+            await sleep(2000 + Math.random() * 1000);
 
-            // Upload 4 original images
+            // Upload 4 original images with random delays
             for (let i = 0; i < 4; i++) {
                 await this.uploadRandomImage(true, i);
-                await sleep(1000);
+                await sleep(1000 + Math.random() * 2000);
             }
 
             // Upload 1 compare image
             await this.uploadRandomImage(false);
             
-            await sleep(1000);
+            await sleep(1000 + Math.random() * 1000);
         } catch (error) {
             throw error;
         }
     }
 
     async runContinuous() {
+        let consecutiveErrors = 0;
+        const maxConsecutiveErrors = 3;
+
         while (true) {
             try {
                 console.log(chalk.cyan(`\n[Wallet ${this.walletIndex + 1}] === Starting new cycle ===`));
@@ -326,6 +349,7 @@ Issued At: ${now.toISOString()}`;
                 console.log(chalk.yellow(`[Wallet ${this.walletIndex + 1}] Current points:`, startPoints));
 
                 await this.runCycle();
+                consecutiveErrors = 0;  // Reset error counter on success
 
                 const endPoints = await this.getPoints();
                 console.log(chalk.green(`[Wallet ${this.walletIndex + 1}] Points earned:`, endPoints - startPoints));
@@ -335,13 +359,30 @@ Issued At: ${now.toISOString()}`;
 
             } catch (error) {
                 console.error(chalk.red(`[Wallet ${this.walletIndex + 1}] Error:`, error.message));
+                consecutiveErrors++;
                 
                 if (error.response?.status === 401) {
                     console.log(chalk.yellow(`[Wallet ${this.walletIndex + 1}] Auth token expired, will re-login`));
                     this.authToken = null;
                 }
 
-                await sleep(60000);
+                const backoffDelay = Math.min(60000 * Math.pow(2, consecutiveErrors - 1), 300000);
+                console.log(chalk.yellow(
+                    `[Wallet ${this.walletIndex + 1}] Consecutive errors: ${consecutiveErrors}, ` +
+                    `waiting ${Math.floor(backoffDelay/1000)}s before retry...`
+                ));
+
+                if (consecutiveErrors >= maxConsecutiveErrors) {
+                    console.log(chalk.red(
+                        `[Wallet ${this.walletIndex + 1}] Too many consecutive errors, ` +
+                        `forcing relogin and extended cooldown...`
+                    ));
+                    this.authToken = null;
+                    consecutiveErrors = 0;
+                    await sleep(300000); // 5 minute cooldown
+                } else {
+                    await sleep(backoffDelay);
+                }
             }
         }
     }
